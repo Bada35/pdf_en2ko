@@ -9,12 +9,17 @@ DEEPL_API_URL = 'https://api-free.deepl.com/v2/translate'
 
 def translate_text(text, source_lang='EN', target_lang='KO'):
     """DeepL API로 텍스트 번역"""
-    if not text.strip():
+    text_clean = text.strip()
+    if not text_clean:
+        return text
+    
+    # 특수 문자만 있는 경우 (점선 등) 번역하지 않음
+    if text_clean.replace('.', '').replace('-', '').replace('_', '').replace(' ', '').strip() == '':
         return text
     
     payload = {
         'auth_key': DEEPL_API_KEY,
-        'text': text,
+        'text': text_clean,
         'source_lang': source_lang,
         'target_lang': target_lang
     }
@@ -23,14 +28,23 @@ def translate_text(text, source_lang='EN', target_lang='KO'):
         response = requests.post(DEEPL_API_URL, data=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
-            translated = result['translations'][0]['text']
-            # 번역 결과가 원본과 다른지 확인
-            if translated == text:
-                print(f"  ⚠️ 번역 결과가 원본과 동일 (API 응답 확인 필요)")
-            return translated
+            if 'translations' in result and len(result['translations']) > 0:
+                translated = result['translations'][0]['text']
+                # 번역 결과가 원본과 다른지 확인
+                if translated.strip() == text_clean:
+                    # 원본과 동일하면 다시 시도 (API가 번역을 건너뛴 경우)
+                    return text
+                return translated
+            else:
+                return text
         else:
-            print(f"⚠️ 번역 오류 {response.status_code}: {response.text[:200]}")
+            error_msg = response.text[:200] if hasattr(response, 'text') else str(response.status_code)
+            if response.status_code != 429:  # Rate limit이 아니면만 출력
+                print(f"⚠️ 번역 오류 {response.status_code}: {error_msg}")
             return text
+    except requests.exceptions.Timeout:
+        print(f"⚠️ 번역 타임아웃")
+        return text
     except Exception as e:
         print(f"❌ 번역 실패: {e}")
         return text
@@ -177,94 +191,127 @@ def translate_pdf_with_layout(input_pdf, output_pdf, batch_size=10):
         
         # 4. 번역된 텍스트를 같은 위치에 삽입
         inserted_count = 0
+        skipped_count = 0
+        
         for idx, (block, translated_text) in enumerate(zip(text_blocks, translated_texts)):
             bbox = block["bbox"]
             font_size = block["size"]
-            original_text = block["text"]
+            original_text = block["text"].strip()
+            translated_text_clean = translated_text.strip() if translated_text else ""
+            
+            # 빈 텍스트는 건너뛰기
+            if not translated_text_clean:
+                skipped_count += 1
+                continue
             
             # 번역이 실제로 되었는지 확인
-            if translated_text == original_text:
-                print(f"  ⚠️ 블록 {idx+1}: 번역되지 않음 (원본과 동일)")
+            if translated_text_clean == original_text:
+                # 번역이 안 된 경우, 원본 텍스트를 그대로 사용하지 않고 다시 번역 시도
+                retry_translated = translate_text(original_text)
+                if retry_translated != original_text and retry_translated.strip():
+                    translated_text_clean = retry_translated.strip()
+                else:
+                    # 번역 실패해도 원본 텍스트는 삽입
+                    translated_text_clean = original_text
             
             # bbox를 Rect 객체로 변환
             text_rect = fitz.Rect(bbox)
             
-            # 텍스트 삽입
-            try:
-                # 한글 폰트 사용
-                if korean_font_path:
-                    result = page.insert_textbox(
-                        text_rect,
-                        translated_text,
-                        fontsize=font_size * 0.9,  # 한글은 약간 작게
-                        fontname="noto",
-                        fontfile=korean_font_path,
-                        color=(0, 0, 0),
-                        align=0  # 좌측 정렬
-                    )
-                else:
-                    # 폰트 없으면 기본 폰트
-                    result = page.insert_textbox(
-                        text_rect,
-                        translated_text,
-                        fontsize=font_size * 0.9,
-                        color=(0, 0, 0),
-                        align=0
-                    )
-                
-                # insert_textbox는 남은 공간을 반환 (음수면 실패)
-                if result < 0:
-                    print(f"  ⚠️ 블록 {idx+1}: 텍스트가 bbox에 맞지 않음 (남은 공간: {result})")
-                    # 텍스트가 너무 길면 줄여서 다시 시도
-                    if abs(result) > 100:  # 많이 넘치면
-                        # 폰트 크기를 더 줄여서 시도
-                        smaller_font = max(font_size * 0.7, 6)
-                        if korean_font_path:
-                            result2 = page.insert_textbox(
-                                text_rect,
-                                translated_text,
-                                fontsize=smaller_font,
-                                fontname="noto",
-                                fontfile=korean_font_path,
-                                color=(0, 0, 0),
-                                align=0
-                            )
-                        else:
-                            result2 = page.insert_textbox(
-                                text_rect,
-                                translated_text,
-                                fontsize=smaller_font,
-                                color=(0, 0, 0),
-                                align=0
-                            )
-                        if result2 >= 0:
-                            inserted_count += 1
+            # 텍스트 삽입 시도
+            success = False
+            font_sizes_to_try = [
+                font_size * 0.9,  # 기본 크기
+                font_size * 0.8,  # 조금 작게
+                font_size * 0.7,  # 더 작게
+                max(font_size * 0.6, 6)  # 최소 크기
+            ]
+            
+            for try_font_size in font_sizes_to_try:
+                try:
+                    if korean_font_path:
+                        result = page.insert_textbox(
+                            text_rect,
+                            translated_text_clean,
+                            fontsize=try_font_size,
+                            fontname="noto",
+                            fontfile=korean_font_path,
+                            color=(0, 0, 0),
+                            align=0
+                        )
                     else:
-                        # insert_text 사용 (단일 라인)
+                        result = page.insert_textbox(
+                            text_rect,
+                            translated_text_clean,
+                            fontsize=try_font_size,
+                            color=(0, 0, 0),
+                            align=0
+                        )
+                    
+                    # 성공 (남은 공간이 0 이상)
+                    if result >= 0:
+                        inserted_count += 1
+                        success = True
+                        break
+                    # 실패했지만 약간만 넘친 경우 (-10 이하) - 텍스트를 약간 자르기
+                    elif result > -10:
+                        # 텍스트를 약간 줄여서 재시도
+                        words = translated_text_clean.split()
+                        if len(words) > 1:
+                            # 마지막 단어 제거하고 재시도
+                            shortened = " ".join(words[:-1])
+                            if korean_font_path:
+                                result2 = page.insert_textbox(
+                                    text_rect,
+                                    shortened,
+                                    fontsize=try_font_size,
+                                    fontname="noto",
+                                    fontfile=korean_font_path,
+                                    color=(0, 0, 0),
+                                    align=0
+                                )
+                            else:
+                                result2 = page.insert_textbox(
+                                    text_rect,
+                                    shortened,
+                                    fontsize=try_font_size,
+                                    color=(0, 0, 0),
+                                    align=0
+                                )
+                            if result2 >= 0:
+                                inserted_count += 1
+                                success = True
+                                break
+                except Exception as e:
+                    continue
+            
+            # 모든 시도 실패 시 insert_text로 단일 라인 삽입
+            if not success:
+                try:
+                    # 텍스트가 너무 길면 자르기
+                    display_text = translated_text_clean
+                    if len(display_text) > 100:
+                        display_text = display_text[:97] + "..."
+                    
+                    if korean_font_path:
                         page.insert_text(
                             (text_rect.x0, text_rect.y0 + font_size * 0.9),
-                            translated_text[:50] + "..." if len(translated_text) > 50 else translated_text,
+                            display_text,
+                            fontsize=font_size * 0.9,
+                            fontfile=korean_font_path,
+                            color=(0, 0, 0)
+                        )
+                    else:
+                        page.insert_text(
+                            (text_rect.x0, text_rect.y0 + font_size * 0.9),
+                            display_text,
                             fontsize=font_size * 0.9,
                             color=(0, 0, 0)
                         )
-                        inserted_count += 1
-                else:
                     inserted_count += 1
-            except Exception as e:
-                print(f"  ⚠️ 블록 {idx+1} 텍스트 삽입 실패: {e}")
-                # 실패해도 insert_text로 시도
-                try:
-                    page.insert_text(
-                        (text_rect.x0, text_rect.y0 + font_size * 0.9),
-                        translated_text[:100],
-                        fontsize=font_size * 0.9,
-                        color=(0, 0, 0)
-                    )
-                    inserted_count += 1
-                except:
-                    pass
+                except Exception as e:
+                    skipped_count += 1
         
-        print(f"  📝 {inserted_count}/{len(text_blocks)} 블록 삽입 성공")
+        print(f"  📝 {inserted_count}/{len(text_blocks)} 블록 삽입 성공, {skipped_count}개 건너뜀")
         
         print(f"  ✅ 페이지 {page_num + 1} 완료\n")
     
