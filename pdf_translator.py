@@ -20,12 +20,16 @@ def translate_text(text, source_lang='EN', target_lang='KO'):
     }
     
     try:
-        response = requests.post(DEEPL_API_URL, data=payload)
+        response = requests.post(DEEPL_API_URL, data=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
-            return result['translations'][0]['text']
+            translated = result['translations'][0]['text']
+            # 번역 결과가 원본과 다른지 확인
+            if translated == text:
+                print(f"  ⚠️ 번역 결과가 원본과 동일 (API 응답 확인 필요)")
+            return translated
         else:
-            print(f"⚠️ 번역 오류 {response.status_code}: {response.text}")
+            print(f"⚠️ 번역 오류 {response.status_code}: {response.text[:200]}")
             return text
     except Exception as e:
         print(f"❌ 번역 실패: {e}")
@@ -65,13 +69,16 @@ def extract_text_blocks(page):
         if block["type"] == 0:  # 텍스트 블록
             for line in block["lines"]:
                 for span in line["spans"]:
-                    text_blocks.append({
-                        "text": span["text"],
-                        "bbox": span["bbox"],  # (x0, y0, x1, y1)
-                        "size": span["size"],
-                        "font": span["font"],
-                        "color": span["color"]
-                    })
+                    text = span["text"].strip()
+                    # 빈 텍스트나 공백만 있는 경우 제외
+                    if text and len(text) > 0:
+                        text_blocks.append({
+                            "text": span["text"],  # 원본 텍스트 (공백 포함)
+                            "bbox": span["bbox"],  # (x0, y0, x1, y1)
+                            "size": span["size"],
+                            "font": span["font"],
+                            "color": span["color"]
+                        })
     
     return text_blocks
 
@@ -101,38 +108,93 @@ def translate_pdf_with_layout(input_pdf, output_pdf, batch_size=10):
             continue
         
         # 2. 텍스트 배치 번역 (API 호출 최소화)
-        texts_to_translate = [block["text"] for block in text_blocks]
+        texts_to_translate = [block["text"].strip() for block in text_blocks]
         
         # 배치 처리
         translated_texts = []
         for i in range(0, len(texts_to_translate), batch_size):
             batch = texts_to_translate[i:i+batch_size]
-            combined_text = "\n###SPLIT###\n".join(batch)
+            # 빈 텍스트 필터링
+            valid_batch = [(idx, t) for idx, t in enumerate(batch) if t and t.strip()]
+            
+            if not valid_batch:
+                # 모두 빈 텍스트면 원본 그대로
+                translated_texts.extend(batch)
+                continue
+            
+            # 유효한 텍스트만 번역
+            valid_texts = [t for _, t in valid_batch]
+            combined_text = "\n###SPLIT###\n".join(valid_texts)
             
             translated_combined = translate_text(combined_text)
-            translated_batch = translated_combined.split("\n###SPLIT###\n")
             
-            # 분할 개수가 안 맞으면 개별 번역
-            if len(translated_batch) != len(batch):
-                translated_batch = [translate_text(t) for t in batch]
+            # 번역이 실제로 되었는지 확인
+            if translated_combined == combined_text or not translated_combined.strip():
+                print(f"  ⚠️ 배치 {i//batch_size + 1}: 번역 실패, 개별 재시도")
+                # 개별 번역으로 재시도 (최대 2회)
+                translated_batch = []
+                for orig_text in batch:
+                    if not orig_text or not orig_text.strip():
+                        translated_batch.append(orig_text)
+                        continue
+                    translated = translate_text(orig_text)
+                    # 재시도 후에도 동일하면 한 번 더 시도
+                    if translated == orig_text:
+                        translated = translate_text(orig_text)
+                    translated_batch.append(translated)
+            else:
+                translated_batch_split = translated_combined.split("\n###SPLIT###\n")
+                
+                # 분할 개수가 안 맞으면 개별 번역
+                if len(translated_batch_split) != len(valid_texts):
+                    print(f"  ⚠️ 배치 분할 불일치 ({len(translated_batch_split)}/{len(valid_texts)}), 개별 번역")
+                    translated_batch = []
+                    for orig_text in batch:
+                        if not orig_text or not orig_text.strip():
+                            translated_batch.append(orig_text)
+                        else:
+                            translated_batch.append(translate_text(orig_text))
+                else:
+                    # 번역 결과를 원래 순서대로 배치
+                    translated_batch = []
+                    valid_idx = 0
+                    for orig_text in batch:
+                        if not orig_text or not orig_text.strip():
+                            translated_batch.append(orig_text)
+                        else:
+                            translated_batch.append(translated_batch_split[valid_idx])
+                            valid_idx += 1
             
             translated_texts.extend(translated_batch)
             print(f"  🔄 {min(i+batch_size, len(texts_to_translate))}/{len(texts_to_translate)} 블록 번역 완료")
         
-        # 3. 원본 텍스트 제거
-        page.clean_contents()  # 페이지 정리
+        # 3. 원본 텍스트를 흰색으로 덮기 (이미지 등은 보존)
+        for block in text_blocks:
+            bbox = block["bbox"]
+            text_rect = fitz.Rect(bbox)
+            # 텍스트 영역을 흰색으로 덮기 (약간 여유 공간 추가)
+            page.draw_rect(text_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
         
         # 4. 번역된 텍스트를 같은 위치에 삽입
-        for block, translated_text in zip(text_blocks, translated_texts):
+        inserted_count = 0
+        for idx, (block, translated_text) in enumerate(zip(text_blocks, translated_texts)):
             bbox = block["bbox"]
             font_size = block["size"]
+            original_text = block["text"]
+            
+            # 번역이 실제로 되었는지 확인
+            if translated_text == original_text:
+                print(f"  ⚠️ 블록 {idx+1}: 번역되지 않음 (원본과 동일)")
+            
+            # bbox를 Rect 객체로 변환
+            text_rect = fitz.Rect(bbox)
             
             # 텍스트 삽입
             try:
                 # 한글 폰트 사용
                 if korean_font_path:
-                    page.insert_textbox(
-                        bbox,
+                    result = page.insert_textbox(
+                        text_rect,
                         translated_text,
                         fontsize=font_size * 0.9,  # 한글은 약간 작게
                         fontname="noto",
@@ -142,15 +204,67 @@ def translate_pdf_with_layout(input_pdf, output_pdf, batch_size=10):
                     )
                 else:
                     # 폰트 없으면 기본 폰트
-                    page.insert_textbox(
-                        bbox,
+                    result = page.insert_textbox(
+                        text_rect,
                         translated_text,
                         fontsize=font_size * 0.9,
                         color=(0, 0, 0),
                         align=0
                     )
+                
+                # insert_textbox는 남은 공간을 반환 (음수면 실패)
+                if result < 0:
+                    print(f"  ⚠️ 블록 {idx+1}: 텍스트가 bbox에 맞지 않음 (남은 공간: {result})")
+                    # 텍스트가 너무 길면 줄여서 다시 시도
+                    if abs(result) > 100:  # 많이 넘치면
+                        # 폰트 크기를 더 줄여서 시도
+                        smaller_font = max(font_size * 0.7, 6)
+                        if korean_font_path:
+                            result2 = page.insert_textbox(
+                                text_rect,
+                                translated_text,
+                                fontsize=smaller_font,
+                                fontname="noto",
+                                fontfile=korean_font_path,
+                                color=(0, 0, 0),
+                                align=0
+                            )
+                        else:
+                            result2 = page.insert_textbox(
+                                text_rect,
+                                translated_text,
+                                fontsize=smaller_font,
+                                color=(0, 0, 0),
+                                align=0
+                            )
+                        if result2 >= 0:
+                            inserted_count += 1
+                    else:
+                        # insert_text 사용 (단일 라인)
+                        page.insert_text(
+                            (text_rect.x0, text_rect.y0 + font_size * 0.9),
+                            translated_text[:50] + "..." if len(translated_text) > 50 else translated_text,
+                            fontsize=font_size * 0.9,
+                            color=(0, 0, 0)
+                        )
+                        inserted_count += 1
+                else:
+                    inserted_count += 1
             except Exception as e:
-                print(f"  ⚠️ 텍스트 삽입 실패: {e}")
+                print(f"  ⚠️ 블록 {idx+1} 텍스트 삽입 실패: {e}")
+                # 실패해도 insert_text로 시도
+                try:
+                    page.insert_text(
+                        (text_rect.x0, text_rect.y0 + font_size * 0.9),
+                        translated_text[:100],
+                        fontsize=font_size * 0.9,
+                        color=(0, 0, 0)
+                    )
+                    inserted_count += 1
+                except:
+                    pass
+        
+        print(f"  📝 {inserted_count}/{len(text_blocks)} 블록 삽입 성공")
         
         print(f"  ✅ 페이지 {page_num + 1} 완료\n")
     
